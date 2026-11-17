@@ -47270,6 +47270,7 @@ index2.__index = index2
 index2.new = function(displayOrder)
 local root = v115.new("esp.root")
 local v117 = root:Add(Instance.new("ScreenGui"))
+v117:SetAttribute("AkariUnstyled", true)
 v117.Enabled = true
 v117.IgnoreGuiInset = true
 v117.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
@@ -48679,13 +48680,17 @@ enemy = esp.Team
 enemyEnabled = arg._teamEnabled
 end
 
-enemyEnabled = arg._mainEnabled and enemyEnabled and fighterState.EnvironmentId ~= nil
+enemyEnabled = arg._mainEnabled and enemyEnabled
 local presentedDisplay
 
-if arg._useDisplayName then
-presentedDisplay = arg._playerIdentities:GetPresentedDisplay(fighterState.Player)
+local identities = arg._playerIdentities
+
+if identities == nil then
+presentedDisplay = fighterState.Player.Name
+elseif arg._useDisplayName then
+presentedDisplay = identities:GetPresentedDisplay(fighterState.Player)
 else
-presentedDisplay = arg._playerIdentities:GetPresented(fighterState.Player)
+presentedDisplay = identities:GetPresented(fighterState.Player)
 end
 
 local snapshot = arg._snapshot
@@ -48897,7 +48902,13 @@ local hidden = not arg._mainEnabled
 if hidden and arg._hidden then
 return
 end
-local boundCamera = arg._boundCamera
+local boundCamera = arg._boundCamera or v124.CurrentCamera
+
+if boundCamera == nil then
+return
+end
+
+arg._boundCamera = boundCamera
 local cFrame = boundCamera.CFrame
 local viewportSize = boundCamera.ViewportSize
 local frame = arg._frame
@@ -67147,6 +67158,10 @@ end
 do
     local textClasses = { TextLabel = true, TextButton = true, TextBox = true }
     local locked = setmetatable({}, { __mode = "k" })
+    -- ScreenGuis this build mounts. The lock only ever reaches text inside
+    -- them, so the game's own interface and the core UI stay untouched.
+    local owned = setmetatable({}, { __mode = "k" })
+    local watched = setmetatable({}, { __mode = "k" })
     -- Minecraftia sets about 1.3x wider than the face the layout was built
     -- against, so text was running past its box. 0.78 lands inside the widths
     -- the library already reserves; sizeFloor keeps small labels legible.
@@ -67189,8 +67204,42 @@ do
         end)
     end
 
+    -- ESP draws its own face and sizes every label from TextBounds, so its
+    -- ScreenGui is tagged and its subtrees are left alone.
+    local function isExempt(instance)
+        local node = instance
+
+        while node ~= nil do
+            local ok, flagged = pcall(function()
+                return node:GetAttribute("AkariUnstyled")
+            end)
+
+            if ok and flagged == true then
+                return true
+            end
+
+            node = node.Parent
+        end
+
+        return false
+    end
+
+    local function isOwned(instance)
+        local node = instance
+
+        while node ~= nil do
+            if owned[node] then
+                return true
+            end
+
+            node = node.Parent
+        end
+
+        return false
+    end
+
     local function lockText(instance)
-        if locked[instance] then
+        if locked[instance] or isExempt(instance) then
             return
         end
 
@@ -67250,8 +67299,35 @@ do
         end)
     end
 
-    -- Switching the picker runs one sweep over the executor container and
-    -- restyles every text instance this build owns. Game text is untouched.
+    -- Every text instance this build parents under one of its own ScreenGuis
+    -- gets the active face once and is put back on any later overwrite.
+    local function watch(root)
+        if watched[root] then
+            return
+        end
+
+        watched[root] = true
+
+        local function handle(descendant)
+            if textClasses[descendant.ClassName] then
+                pcall(lockText, descendant)
+            end
+        end
+
+        pcall(function()
+            for _, descendant in ipairs(root:GetDescendants()) do
+                handle(descendant)
+            end
+
+            local connection = root.DescendantAdded:Connect(handle)
+
+            root.Destroying:Connect(function()
+                connection:Disconnect()
+            end)
+        end)
+    end
+
+    -- Switching the picker runs one sweep over the guis this build owns.
     local function restyle()
         local face = activeFace()
 
@@ -67259,23 +67335,19 @@ do
             return
         end
 
-        pcall(function()
-            local container = gethui()
+        for root in owned, nil, nil do
+            pcall(function()
+                for _, descendant in ipairs(root:GetDescendants()) do
+                    if textClasses[descendant.ClassName] and not isExempt(descendant) then
+                        if not locked[descendant] then
+                            pcall(lockText, descendant)
+                        end
 
-            if container == nil then
-                return
-            end
-
-            for _, descendant in ipairs(container:GetDescendants()) do
-                if textClasses[descendant.ClassName] then
-                    if not locked[descendant] then
-                        pcall(lockText, descendant)
+                        applyFace(descendant, face)
                     end
-
-                    applyFace(descendant, face)
                 end
-            end
-        end)
+            end)
+        end
     end
 
     do
@@ -67294,24 +67366,19 @@ do
         Instance.new = function(className, parent)
             local instance = nativeNew(className, parent)
 
-            if textClasses[className] then
-                pcall(lockText, instance)
+            if className == "ScreenGui" then
+                owned[instance] = true
+                watch(instance)
+            elseif textClasses[className] then
+                local okOwned, inBuild = pcall(isOwned, instance)
+
+                if okOwned and inBuild then
+                    pcall(lockText, instance)
+                end
             end
 
             return instance
         end
-    end)
-
-    -- every gui this build mounts lives in the executor container, so this
-    -- listener sees our widgets and nothing from the game itself.
-    pcall(function()
-        local container = gethui()
-
-        container.DescendantAdded:Connect(function(descendant)
-            if textClasses[descendant.ClassName] then
-                pcall(lockText, descendant)
-            end
-        end)
     end)
 
     restyle()
